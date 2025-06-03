@@ -1,0 +1,252 @@
+import os
+import re
+import numpy as np
+import pandas as pd
+import subprocess
+import tempfile
+import shutil
+import time
+from cclib.io import ccread
+from cclib.parser.utils import convertor
+
+def wavenumber_to_ev(value_cm1):
+    """cm⁻¹ 到 eV 的转换"""
+    return value_cm1 * 1.2398419843320026e-4
+
+def extract_indices(output):
+    """
+    从Multiwfn输出中提取Sr、HDI、EDI指数
+    """
+    patterns = {
+        'Sr': r"Sr index \(integral of Sr function\):\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*a\.u\.",
+        'HDI': r"Hole delocalization index \(HDI\):\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)",
+        'EDI': r"Electron delocalization index \(EDI\):\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
+    }
+    
+    results = {}
+    for key, pattern in patterns.items():
+        match = re.search(pattern, output)
+        results[key] = float(match.group(1)) if match else None
+        
+    return results.get('HDI'), results.get('EDI'), results.get('Sr')
+
+def run_multiwfn(fchk_path, out_path, state, multiwfn_path):
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 创建临时文件副本
+            tmp_fchk = os.path.join(tmpdir, os.path.basename(fchk_path))
+            shutil.copy(fchk_path, tmp_fchk)
+            
+            # 构建Multiwfn输入脚本
+            script = f"""
+{tmp_fchk}
+18
+1
+{out_path}
+{state}
+1
+3
+0
+0
+q
+"""
+            script_path = os.path.join(tmpdir, "multiwfn_input.txt")
+            with open(script_path, "w") as f:
+                f.write(script)
+            
+            # 执行Multiwfn
+            result = subprocess.run(
+                [multiwfn_path, tmp_fchk],
+                stdin=open(script_path, "r"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=tmpdir,
+                timeout=120
+            )
+            
+            # 处理输出
+            output = result.stdout
+            if result.returncode != 0:
+                return None, None, None
+                
+            return extract_indices(output)
+            
+    except Exception as e:
+        return None, None, None
+
+def gaussian_to_csv(out_dir, fchk_dir, output_csv="tddft_data.csv", num_states=6, multiwfn_path=None):
+    # 初始化数据结构
+    data = {'Sample': []}
+    energy_cols = ['Total_Energy', 'HOMO_Energy', 'LUMO_Energy', 'HOMO_LUMO_Gap']
+    for col in energy_cols:
+        data[col] = []
+    
+    # 初始化激发态数据列
+    for i in range(1, num_states + 1):
+        data[f'E{i}_eV'] = []
+        data[f'λ{i}_nm'] = []
+        data[f'f{i}'] = []
+        data[f'Type{i}'] = []
+        data[f'Sr{i}'] = []
+        data[f'H_D{i}'] = []
+        data[f'E_D{i}'] = []
+    
+    # 光谱数据列
+    wavelengths = np.arange(100, 601, 1)
+    for wl in wavelengths:
+        data[f'I_{wl}nm'] = []
+    
+    processed_count = 0
+    start_time = time.time()
+    
+    # 处理目录中的.out文件
+    for filename in os.listdir(out_dir):
+        if not filename.endswith('.out'):
+            continue
+            
+        out_path = os.path.join(out_dir, filename)
+        base_name = os.path.splitext(filename)[0]
+        fchk_path = os.path.join(fchk_dir, f"{base_name}.fchk")
+        
+        # 检查文件是否存在
+        if not os.path.exists(fchk_path):
+            print(f"[SKIP] fchk file not found for {base_name}")
+            continue
+            
+        print(f"Processing {base_name} ({processed_count+1}/100)")
+        data['Sample'].append(base_name)
+        
+        try:
+            # 解析输出文件
+            data_obj = ccread(out_path)
+            
+            # 添加能量信息
+            if hasattr(data_obj, "scfenergies") and data_obj.scfenergies is not None and len(data_obj.scfenergies) > 0:
+                data['Total_Energy'].append(data_obj.scfenergies[-1])
+            else:
+                data['Total_Energy'].append(None)
+            
+            # 轨道能量处理
+            if (
+                hasattr(data_obj, "moenergies") and data_obj.moenergies is not None and len(data_obj.moenergies) > 0 and
+                hasattr(data_obj, "homos") and data_obj.homos is not None
+            ):
+                homo_idx = data_obj.homos[0] if isinstance(data_obj.homos, (list, np.ndarray)) else data_obj.homos
+                mo_energies = data_obj.moenergies[0] if isinstance(data_obj.moenergies, (list, np.ndarray)) else data_obj.moenergies
+                if len(mo_energies) > homo_idx + 1:
+                    homo_ev = convertor(mo_energies[homo_idx], 'hartree', 'eV')
+                    lumo_ev = convertor(mo_energies[homo_idx+1], 'hartree', 'eV')
+                    gap = lumo_ev - homo_ev
+                    data['HOMO_Energy'].append(homo_ev)
+                    data['LUMO_Energy'].append(lumo_ev)
+                    data['HOMO_LUMO_Gap'].append(gap)
+                else:
+                    for col in ['HOMO_Energy', 'LUMO_Energy', 'HOMO_LUMO_Gap']:
+                        data[col].append(None)
+            else:
+                for col in ['HOMO_Energy', 'LUMO_Energy', 'HOMO_LUMO_Gap']:
+                    data[col].append(None)
+            
+            # 光谱初始化
+            spectrum = np.zeros(len(wavelengths))
+            
+            # 处理激发态
+            for i in range(num_states):
+                # 添加基础数据
+                if hasattr(data_obj, "etenergies") and data_obj.etenergies is not None and len(data_obj.etenergies) > i:
+                    energy_raw = data_obj.etenergies[i]
+                    # 修正：判断单位（eV还是cm^-1），统一转换为eV
+                    if energy_raw > 1000:  # 一般TDDFT激发能如果大于1000，说明是cm^-1
+                        energy_ev = wavenumber_to_ev(energy_raw)
+                    else:
+                        energy_ev = energy_raw
+                    wavelength = 1240 / energy_ev if (energy_ev is not None and energy_ev != 0) else None
+                    oscillator = data_obj.etoscs[i] if hasattr(data_obj, "etoscs") and len(data_obj.etoscs) > i else None
+                    
+                    # 跃迁类型
+                    transition_type = ""
+                    if hasattr(data_obj, 'etsyms') and i < len(data_obj.etsyms):
+                        transition_type = "Singlet" if "Singlet" in data_obj.etsyms[i] else "Triplet"
+                    
+                    data[f'E{i+1}_eV'].append(energy_ev)
+                    data[f'λ{i+1}_nm'].append(wavelength)
+                    data[f'f{i+1}'].append(oscillator)
+                    data[f'Type{i+1}'].append(transition_type)
+                    
+                    # 获取Multiwfn指数
+                    H_D, E_D, Sr = None, None, None
+                    if multiwfn_path:
+                        H_D, E_D, Sr = run_multiwfn(fchk_path, out_path, i+1, multiwfn_path)
+                    
+                    data[f'Sr{i+1}'].append(Sr)
+                    data[f'H_D{i+1}'].append(H_D)
+                    data[f'E_D{i+1}'].append(E_D)
+                    
+                    # 添加到光谱
+                    if wavelength is not None and oscillator is not None:
+                        sigma = 15
+                        spectrum += oscillator * np.exp(-((wavelengths - wavelength) ** 2) / (2 * sigma ** 2))
+                else:
+                    # 填充空值
+                    data[f'E{i+1}_eV'].append(None)
+                    data[f'λ{i+1}_nm'].append(None)
+                    data[f'f{i+1}'].append(None)
+                    data[f'Type{i+1}'].append(None)
+                    data[f'Sr{i+1}'].append(None)
+                    data[f'H_D{i+1}'].append(None)
+                    data[f'E_D{i+1}'].append(None)
+            
+            # 添加光谱数据
+            for j, wl in enumerate(wavelengths):
+                data[f'I_{wl}nm'].append(spectrum[j])
+            
+            processed_count += 1
+            print(f"  Completed in {time.time()-start_time:.1f}s")
+            
+            # 定期保存
+            if processed_count % 5 == 0:
+                pd.DataFrame(data).to_csv(f"checkpoint_{processed_count}.csv", index=False)
+                
+            # 达到100个文件后停止
+            if processed_count >= 100:
+                break
+                
+        except Exception as e:
+            print(f"  Error processing {base_name}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # 移除当前分子的数据
+            for key in data:
+                if key != 'Sample' and len(data[key]) == len(data['Sample']):
+                    data[key].pop()
+            if data['Sample'] and data['Sample'][-1] == base_name:
+                data['Sample'].pop()
+    
+    # 创建DataFrame并保存
+    df = pd.DataFrame(data)
+    df.to_csv(output_csv, index=False)
+    
+    print(f"\nProcessed {processed_count} files in {time.time()-start_time:.1f} seconds")
+    print(f"Results saved to {output_csv}")
+    
+    return df
+
+if __name__ == "__main__":
+    # 配置路径
+    OUT_DIR = r"C:/Users/DELL/Desktop/out/"
+    FCHK_DIR = r"C:/Users/DELL/Desktop/fchk/"
+    OUTPUT_CSV = "tddft_spectral_data.csv"
+    MULTIWFN_PATH = r"C:/Users/DELL/Desktop/毕业设计/Multiwfn_3.8_dev_bin_Win64/Multiwfn.exe"
+    
+    print("Starting TDDFT data processing...")
+    df = gaussian_to_csv(
+        out_dir=OUT_DIR,
+        fchk_dir=FCHK_DIR,
+        output_csv=OUTPUT_CSV,
+        num_states=6,
+        multiwfn_path=MULTIWFN_PATH
+    )
+    
+    print("\nProcessing complete. Final data preview:")
+    print(df[['Sample', 'Sr1', 'H_D1', 'E_D1']].head())
