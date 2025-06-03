@@ -1,2 +1,2 @@
 # Graduation-Thesis-Project
-毕业设计所用代码与原始数据
+这个仓库中分别是我毕业设计所用代码（python）与原始数据（.out与.fchk文件）
