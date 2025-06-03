@@ -1,0 +1,38 @@
+import os
+import subprocess
+
+def batch_chk_to_fchk(chk_dir, formchk_path='formchk'):
+    """
+    批量将chk目录下的.chk文件转换为.fchk文件
+    :param chk_dir: 存放.chk文件的目录
+    :param formchk_path: formchk程序的可执行路径，默认假定已加入环境变量
+    """
+    files = [f for f in os.listdir(chk_dir) if f.endswith('.chk')]
+    if not files:
+        print("未找到.chk文件。")
+        return
+
+    for fname in files:
+        chk_path = os.path.join(chk_dir, fname)
+        fchk_path = os.path.splitext(chk_path)[0] + '.fchk'
+        if os.path.exists(fchk_path):
+            print(f"已存在：{fchk_path}，跳过。")
+            continue
+        print(f"转换 {chk_path} → {fchk_path} ...")
+        try:
+            # Windows下formchk一般在Gaussian安装目录下，若未加入环境变量可指定完整路径
+            result = subprocess.run([formchk_path, chk_path, fchk_path], 
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if result.returncode != 0:
+                print(f"转换失败: {chk_path}\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}")
+            else:
+                print(f"转换成功: {fchk_path}")
+        except Exception as e:
+            print(f"转换 {chk_path} 时发生异常: {e}")
+
+if __name__ == "__main__":
+    # 替换为你的chk文件所在目录
+    CHK_DIR = r"C:/Users/DELL/Desktop/chk/"
+    # 若formchk未加入环境变量，可写全路径，例如 r"C:/G16W/formchk.exe"
+    FORMCHK_PATH = 'D:/G16W/formchk.exe'  
+    batch_chk_to_fchk(CHK_DIR, FORMCHK_PATH)
