@@ -1,0 +1,136 @@
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
+from sklearn.metrics import (
+    accuracy_score, f1_score, matthews_corrcoef, classification_report, confusion_matrix
+)
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.inspection import permutation_importance
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# 设置中文字体，解决负号显示问题
+import matplotlib
+matplotlib.rcParams['font.sans-serif'] = ['SimHei']
+matplotlib.rcParams['axes.unicode_minus'] = False
+
+# 1. 读取和预处理数据
+df = pd.read_csv('tddft_spectral_data.csv')
+df.columns = df.columns.str.strip()
+y = df['Class']
+X = df.drop(columns=['Sample', 'Class'])
+X = X.select_dtypes(include=['number'])
+
+# 2. 标准化
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# 3. PCA降维
+pca = PCA(n_components=54)
+X_pca = pca.fit_transform(X_scaled)
+print(f"PCA后特征数: {X_pca.shape[1]}")
+
+# 4. 划分训练/测试集
+X_train, X_test, y_train, y_test = train_test_split(
+    X_pca, y, test_size=0.4, random_state=42, stratify=y)
+
+# 5. 随机森林模型与参数（对BETX类别加权）
+clf = RandomForestClassifier(
+    n_estimators=500,
+    max_depth=10,
+    min_samples_split=2,
+    min_samples_leaf=1,
+    max_features='sqrt',
+    random_state=42,
+    n_jobs=-1,
+    class_weight={'BETX': 2, 'PAHs': 1, 'alkanes': 1}
+)
+clf.fit(X_train, y_train)
+y_pred = clf.predict(X_test)
+
+# 6. 评估指标
+accuracy = accuracy_score(y_test, y_pred)
+f1_macro = f1_score(y_test, y_pred, average='macro')
+mcc = matthews_corrcoef(y_test, y_pred)
+print(f"准确率 (Accuracy): {accuracy:.4f}")
+print(f"宏平均F1值 (Macro F1-score): {f1_macro:.4f}")
+print(f"马修斯相关系数 (MCC): {mcc:.4f}")
+print("\n详细分类报告：\n", classification_report(y_test, y_pred))
+
+# 7. 混淆矩阵
+labels = ['BETX', 'PAHs', 'alkanes']
+cm = confusion_matrix(y_test, y_pred, labels=labels)
+print("混淆矩阵：")
+print(pd.DataFrame(cm, index=labels, columns=labels))
+
+# 可视化混淆矩阵
+plt.figure(figsize=(6,5))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=labels, yticklabels=labels)
+plt.xlabel('预测类别')
+plt.ylabel('真实类别')
+plt.title('混淆矩阵')
+plt.tight_layout()
+plt.show()
+
+# 统计BETX被误分为PAHs的数量
+betx_to_pahs = cm[0,1]
+print(f"BETX被误分为PAHs的数量：{betx_to_pahs}")
+
+# 8. 基尼重要性 (Gini Importance)
+importances = clf.feature_importances_
+indices = np.argsort(importances)[::-1]
+plt.figure(figsize=(10, 4))
+plt.title("Gini Importance（前20主成分）")
+plt.bar(range(20), importances[indices[:20]])
+plt.xlabel('主成分序号')
+plt.ylabel('重要性')
+plt.xticks(range(20), [f"PC{indices[i]+1}" for i in range(20)], rotation=45)
+plt.tight_layout()
+plt.show()
+
+print("前10主成分的基尼重要性：")
+for i in range(10):
+    print(f"PC{indices[i]+1}: {importances[indices[i]]:.4f}")
+
+# 9. 排列重要性 (Permutation Importance)
+result = permutation_importance(clf, X_test, y_test, n_repeats=10, random_state=42, n_jobs=-1)
+sorted_idx = result.importances_mean.argsort()[::-1]
+plt.figure(figsize=(10, 4))
+plt.boxplot(result.importances[sorted_idx[:20]].T, vert=False, tick_labels=[f"PC{i+1}" for i in sorted_idx[:20]])
+plt.title("Permutation Importance（前20主成分）")
+plt.xlabel("重要性下降均值")
+plt.tight_layout()
+plt.show()
+
+print("\n前10主成分的排列重要性：")
+for i in range(10):
+    print(f"PC{sorted_idx[i]+1}: {result.importances_mean[sorted_idx[i]]:.4f}")
+
+# 10. 交叉验证
+scores = cross_val_score(clf, X_pca, y, cv=5, scoring='accuracy')
+print("5折交叉验证准确率：", scores)
+print("平均准确率：", scores.mean())
+
+# 11. 可选：自动调参（网格搜索）
+param_grid = {
+    'n_estimators': [100, 200, 500],
+    'max_depth': [None, 10, 20],
+    'min_samples_split': [1, 2, 5],
+    'min_samples_leaf': [1, 2, 4],
+    'max_features': ['sqrt', 'log2', None]
+}
+
+grid_search = GridSearchCV(
+    estimator=RandomForestClassifier(class_weight={'BETX': 4, 'PAHs': 1, 'alkanes': 1},
+                                     random_state=42, n_jobs=-1),
+    param_grid=param_grid,
+    cv=3,
+    scoring='accuracy',
+    n_jobs=-1
+)
+grid_search.fit(X_pca, y)
+print("最佳参数：", grid_search.best_params_)
+print("最佳得分：", grid_search.best_score_)
